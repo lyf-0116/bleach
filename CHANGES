@@ -1,6 +1,28 @@
 Bleach changes
 ==============
 
+Version 6.4.1 (unreleased)
+--------------------------
+
+**Security fixes**
+
+* Re-check filter output against the cleaning policy.
+
+  Filters passed to ``Cleaner`` via the ``filters`` argument run after the
+  sanitizing filter and were the last thing able to add or rewrite tokens
+  before serialization, so tags, attributes and URI protocols they produced
+  were never validated. A filter such as ``LinkifyFilter`` could add
+  attributes outside the allowed set, and a custom filter or linkify
+  callback could smuggle event-handler attributes or ``javascript:`` URLs
+  into the "sanitized" output.
+
+  The output of the filter chain is now run through a second
+  ``BleachSanitizerFilter`` pass enforcing the configured tags, attributes
+  and protocols. Filters that legitimately produce tags or attributes the
+  policy does not allow declare them via the new ``produced_tags`` and
+  ``produced_attributes`` class attributes; ``LinkifyFilter`` declares the
+  links it generates.
+
 Version 6.4.0 (June 5th, 2026)
 ------------------------------
 

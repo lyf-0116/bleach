@@ -54,6 +54,92 @@ class NoCssSanitizerWarning(UserWarning):
     pass
 
 
+def _filter_declaration(filter_class, declaration_name, default):
+    """Returns the tags/attributes a filter declares it can produce
+
+    Filters run after the :class:`BleachSanitizerFilter` and are allowed to
+    add or change tokens. Because their output is serialized without any
+    further checks, a filter must declare anything it produces that the
+    configured policy does not already allow.
+
+    The declaration lives as a class attribute so it is also available on
+    ``functools.partial`` wrappers (via ``func``).
+
+    :arg filter_class: filter class, instance or ``functools.partial``
+    :arg str declaration_name: name of the declaring attribute
+    :arg default: value to use when the filter makes no declaration
+
+    :returns: the declared value or ``default``
+
+    """
+    getter = getattr(filter_class, declaration_name, None)
+    if getter is None:
+        partial_func = getattr(filter_class, "func", None)
+        if partial_func is not None:
+            getter = getattr(partial_func, declaration_name, None)
+    if getter is None:
+        return default
+    return getter
+
+
+def collect_filter_produced_tags(filters):
+    """Collects the set of tags the given filters declare they produce"""
+    produced = set()
+    for filter_class in filters:
+        produced.update(_filter_declaration(filter_class, "produced_tags", frozenset()))
+    return frozenset(produced)
+
+
+def collect_filter_produced_attributes(filters):
+    """Collects the attributes the given filters declare they produce
+
+    The declarations have the same shape as the ``attributes`` argument of
+    :class:`Cleaner`: a dict mapping a tag name (or ``"*"``) to a list of
+    attribute names.
+
+    """
+    produced = {}
+    for filter_class in filters:
+        declaration = _filter_declaration(filter_class, "produced_attributes", {})
+        for tag, attr_names in declaration.items():
+            produced.setdefault(tag, set()).update(attr_names)
+    return {tag: set(attr_names) for tag, attr_names in produced.items()}
+
+
+def merge_attributes(attributes, extra_attributes):
+    """Merges two ``attributes`` policy values into a single dict
+
+    Callable policies and per-tag callables are preserved. Lists and the
+    attribute names declared by filters are merged into one list per tag.
+
+    """
+    if callable(attributes):
+        # A callable already has the final say on every attribute, so there
+        # is nothing to merge--it is also applied again on the re-check pass.
+        return attributes
+
+    merged = {}
+    if isinstance(attributes, dict):
+        for tag, value in attributes.items():
+            if callable(value):
+                merged[tag] = value
+            else:
+                merged[tag] = set(value)
+    elif isinstance(attributes, list):
+        merged["*"] = set(attributes)
+
+    for tag, attr_names in extra_attributes.items():
+        existing = merged.get(tag)
+        if callable(existing):
+            continue
+        merged.setdefault(tag, set()).update(attr_names)
+
+    return {
+        tag: value if callable(value) else sorted(value)
+        for tag, value in merged.items()
+    }
+
+
 class Cleaner:
     """Cleaner for cleaning HTML fragments of malicious content
 
@@ -112,10 +198,21 @@ class Cleaner:
 
             .. seealso:: http://html5lib.readthedocs.io/en/latest/movingparts.html#filters
 
+            Filters run after the sanitizing filter, so anything a filter
+            adds or changes is run through a second sanitizing pass before it
+            is serialized: tags and attributes still have to be allowed and
+            URI attribute values still have to use an allowed protocol.
+
+            A filter that emits tags or attributes which are not part of the
+            configured policy must declare them via the ``produced_tags`` and
+            ``produced_attributes`` class attributes. Anything a filter
+            produces without a declaration is stripped on the re-check pass.
+
             .. Warning::
 
-               Using filters changes the output of ``bleach.Cleaner.clean``.
-               Make sure the way the filters change the output are secure.
+               The re-check pass enforces the tag, attribute and protocol
+               policy, but cannot reason about filter-specific behavior. Make
+               sure the way a filter changes output is otherwise secure.
 
         :arg CSSSanitizer css_sanitizer: instance with a "sanitize_css" method for
             sanitizing style attribute values and style text; defaults to None
@@ -202,6 +299,28 @@ class Cleaner:
         # Apply any filters after the BleachSanitizerFilter
         for filter_class in self.filters:
             filtered = filter_class(source=filtered)
+
+        if self.filters:
+            # Filters are the last thing in the stream that can add or
+            # rewrite tokens. Re-run the sanitizing policy over their output
+            # so the serialized text can never contain tags, attributes or
+            # URI protocols that the configured policy does not allow. Tags
+            # and attributes a filter explicitly declares it produces are
+            # added to the policy for this re-check only.
+            recheck_tags = self.tags | collect_filter_produced_tags(self.filters)
+            recheck_attributes = merge_attributes(
+                self.attributes,
+                collect_filter_produced_attributes(self.filters),
+            )
+            filtered = BleachSanitizerFilter(
+                source=filtered,
+                allowed_tags=recheck_tags,
+                attributes=recheck_attributes,
+                strip_disallowed_tags=self.strip,
+                strip_html_comments=self.strip_comments,
+                css_sanitizer=self.css_sanitizer,
+                allowed_protocols=self.protocols,
+            )
 
         return self.serializer.render(filtered)
 

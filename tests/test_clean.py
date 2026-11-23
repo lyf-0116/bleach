@@ -1266,3 +1266,92 @@ class TestCleaner:
 
         dirty = 'this is cute! <img src="http://example.com/puppy.jpg" rel="nofollow">'
         assert cleaner.clean(dirty) == 'this is cute! <img src="moo" rel="moo">'
+
+    def test_filters_recheck_strips_undeclared_attributes(self):
+        # A filter that adds an attribute the policy does not allow and that
+        # the filter does not declare must have it stripped on the re-check
+        # pass after the filter chain.
+        class InjectFilter(Filter):
+            def __iter__(self):
+                for token in Filter.__iter__(self):
+                    if token["type"] == "StartTag" and token["name"] == "a":
+                        token["data"][(None, "onmouseover")] = "alert(1)"
+                    yield token
+
+        cleaner = Cleaner(
+            tags={"a"},
+            attributes={"a": ["href"]},
+            filters=[InjectFilter],
+        )
+
+        out = cleaner.clean('<a href="http://example.com">link</a>')
+        assert "onmouseover" not in out
+        assert out == '<a href="http://example.com">link</a>'
+
+    def test_filters_recheck_blocks_rewritten_protocol(self):
+        # A filter rewriting an allowed href to a disallowed protocol must
+        # lose the attribute on the re-check pass.
+        class ProtoFilter(Filter):
+            def __iter__(self):
+                for token in Filter.__iter__(self):
+                    if token["type"] == "StartTag" and token["name"] == "a":
+                        token["data"][(None, "href")] = "vbscript:msgbox(1)"
+                    yield token
+
+        cleaner = Cleaner(
+            tags={"a"},
+            attributes={"a": ["href"]},
+            filters=[ProtoFilter],
+        )
+
+        out = cleaner.clean('<a href="http://example.com">link</a>')
+        assert "vbscript" not in out
+        assert out == "<a>link</a>"
+
+    def test_filters_recheck_escapes_undeclared_tags(self):
+        # Tags a filter emits without declaring them must still be escaped.
+        class TagFilter(Filter):
+            def __iter__(self):
+                yield from Filter.__iter__(self)
+                yield {"type": "StartTag", "name": "script", "data": {}}
+                yield {"type": "Characters", "data": "alert(1)"}
+                yield {"type": "EndTag", "name": "script"}
+
+        cleaner = Cleaner(filters=[TagFilter])
+        out = cleaner.clean("hi")
+
+        assert "<script>" not in out
+        assert "&lt;script&gt;" in out
+
+    def test_filters_declared_attributes_survive_recheck(self):
+        # Attributes a filter explicitly declares as produced are accepted on
+        # the re-check pass, while undeclared ones are still dropped.
+        class AttrFilter(Filter):
+            produced_attributes = {"a": ["data-safe"]}
+
+            def __iter__(self):
+                for token in Filter.__iter__(self):
+                    if token["type"] == "StartTag" and token["name"] == "a":
+                        token["data"][(None, "data-safe")] = "ok"
+                        token["data"][(None, "data-evil")] = "bad"
+                    yield token
+
+        cleaner = Cleaner(
+            tags={"a"},
+            attributes={"a": ["href"]},
+            filters=[AttrFilter],
+        )
+
+        out = cleaner.clean('<a href="http://example.com">link</a>')
+        assert 'data-safe="ok"' in out
+        assert "data-evil" not in out
+
+    def test_filters_recheck_idempotent(self):
+        # Output of a cleaner with filters must survive another clean pass
+        # unchanged--the re-check makes the sanitized output an invariant.
+        from bleach.linkifier import LinkifyFilter
+
+        cleaner = Cleaner(filters=[LinkifyFilter])
+        once = cleaner.clean("see http://example.com now")
+
+        assert cleaner.clean(once) == once

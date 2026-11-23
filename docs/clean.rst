@@ -399,10 +399,54 @@ Trivial Filter example:
 
 .. Warning::
 
-   Filters change the output of cleaning. Make sure that whatever changes the
-   filter is applying maintain the safety guarantees of the output.
+   Filters change the output of cleaning. Because a filter is the last thing
+   in the stream that can add or rewrite tokens, the output of every
+   configured filter is run through a second
+   :py:class:`bleach.sanitizer.BleachSanitizerFilter` pass before it is
+   serialized. On that re-check pass:
+
+   * tags that are not allowed and that the filter did not declare are
+     escaped (or stripped, depending on ``strip``),
+   * attributes that are not allowed and that the filter did not declare are
+     removed,
+   * URI-valued attributes (for example ``href``) are checked against the
+     allowed protocols again, so a filter that rewrites a link to a
+     ``javascript:`` URL loses that attribute.
+
+Declaring filter output
+~~~~~~~~~~~~~~~~~~~~~~~
+
+A filter that legitimately emits tags or attributes that the configured
+policy does not allow declares them with the ``produced_tags`` and
+``produced_attributes`` class attributes. ``produced_attributes`` uses the
+same shape as the ``attributes`` argument--a dict mapping a tag name (or
+``"*"``) to a list of attribute names::
+
+   from bleach.html5lib_shim import Filter
+
+   class NoteFilter(Filter):
+       # This filter adds data-note attributes to links; declare them so
+       # they survive the sanitizer re-check pass.
+       produced_attributes = {"a": ["data-note"]}
+
+       def __iter__(self):
+           for token in Filter.__iter__(self):
+               if token["type"] == "StartTag" and token["name"] == "a":
+                   token["data"][(None, "data-note")] = "noted"
+               yield token
+
+Anything a filter produces without a declaration is treated as
+policy-violating content and removed. The re-check enforces the tag,
+attribute and protocol policy, but it cannot reason about filter-specific
+behavior, so make sure a filter's changes are otherwise safe.
 
 .. versionadded:: 2.0
+
+.. versionchanged:: 6.4.1
+
+   Filter output is re-checked against the cleaning policy and filters can
+   declare the tags and attributes they produce via ``produced_tags`` and
+   ``produced_attributes``.
 
 
 Using ``bleach.sanitizer.BleachSanitizerFilter``

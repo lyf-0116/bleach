@@ -202,6 +202,18 @@ class LinkifyFilter(html5lib_shim.Filter):
 
     """
 
+    #: Tags this filter can emit. Used by ``Cleaner`` when this filter is
+    #: part of a cleaner's ``filters`` list so the tags it produces survive
+    #: the sanitizer re-check pass that runs after the filter chain.
+    produced_tags = frozenset(("a",))
+
+    #: Attributes this filter can emit, keyed by tag name in the same shape
+    #: as the ``attributes`` argument of ``Cleaner``. ``href`` covers links
+    #: created from text and ``rel`` covers the default ``nofollow``
+    #: callback. Callbacks that add other attributes need a subclass
+    #: declaring them here.
+    produced_attributes = {"a": ["href", "rel"]}
+
     def __init__(
         self,
         source,

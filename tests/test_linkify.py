@@ -819,3 +819,37 @@ class TestLinkify:
 def test_linkify_filter(text, expected):
     cleaner = Cleaner(filters=[LinkifyFilter])
     assert cleaner.clean(text) == expected
+
+
+def test_linkify_filter_declared_attributes_survive():
+    # LinkifyFilter declares the tags/attributes it produces (a@href and
+    # a@rel), so its normal output survives the sanitizer re-check even when
+    # the cleaner policy does not list them.
+    cleaner = Cleaner(tags={"pre"}, filters=[LinkifyFilter])
+    out = cleaner.clean("<pre>http://example.com</pre>")
+
+    assert (
+        out
+        == '<pre><a href="http://example.com" rel="nofollow">http://example.com</a></pre>'
+    )
+
+
+def test_linkify_filter_callback_cannot_smuggle_unsafe_output():
+    # Callbacks run inside the filter chain, which is followed by a
+    # sanitizer re-check pass. An event handler attribute and a javascript:
+    # protocol injected by a callback must not reach the output.
+    def evil_callback(attrs, new=False):
+        attrs[(None, "onclick")] = "alert(1)"
+        attrs[(None, "href")] = "javascript:alert(document.cookie)"
+        return attrs
+
+    class EvilLinkifyFilter(LinkifyFilter):
+        def __init__(self, source):
+            super().__init__(source, callbacks=[evil_callback])
+
+    cleaner = Cleaner(filters=[EvilLinkifyFilter])
+    out = cleaner.clean("example.com")
+
+    assert "onclick" not in out
+    assert "javascript" not in out
+    assert out == "<a>example.com</a>"
