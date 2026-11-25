@@ -1,5 +1,8 @@
 import tinycss2
 
+from bleach.html5lib_shim import svg_attr_val_allows_ref
+from bleach.sanitizer import is_external_reference
+
 
 ALLOWED_CSS_PROPERTIES = frozenset(
     (
@@ -67,6 +70,11 @@ ALLOWED_SVG_PROPERTIES = frozenset(
 )
 
 
+SVG_LOCAL_URL_PROPERTIES = frozenset(
+    name for namespace, name in svg_attr_val_allows_ref if namespace is None
+)
+
+
 class CSSSanitizer:
     def __init__(
         self,
@@ -90,6 +98,11 @@ class CSSSanitizer:
                     token.lower_name in self.allowed_css_properties
                     or token.lower_name in self.allowed_svg_properties
                 ):
+                    if (
+                        token.lower_name in SVG_LOCAL_URL_PROPERTIES
+                        and token.lower_name in self.allowed_svg_properties
+                    ):
+                        token.value = _sanitize_local_url_tokens(token.value)
                     new_tokens.append(token)
             elif token.type in ("comment", "whitespace"):
                 if new_tokens and new_tokens[-1].type != token.type:
@@ -102,3 +115,59 @@ class CSSSanitizer:
             return ""
 
         return tinycss2.serialize(new_tokens).strip()
+
+
+def _sanitize_local_url_tokens(tokens):
+    """Drops non-fragment URL tokens from SVG paint properties."""
+    sanitized = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+
+        if token.type == "url":
+            if not is_external_reference(token.value):
+                sanitized.append(token)
+            index += 1
+            continue
+
+        if token.type in ("function", "function-block") and (token.lower_name == "url"):
+            raw_url = _string_function_url(token)
+            if raw_url is not None and not is_external_reference(raw_url):
+                sanitized.append(token)
+            index += 1
+            continue
+
+        if token.type == "ident" and token.lower_value == "url":
+            block_index = index + 1
+            while (
+                block_index < len(tokens) and tokens[block_index].type == "whitespace"
+            ):
+                block_index += 1
+
+            if block_index < len(tokens) and tokens[block_index].type == "() block":
+                raw_url = _parentheses_block_url(tokens[block_index])
+                if raw_url is not None and not is_external_reference(raw_url):
+                    sanitized.extend(tokens[index : block_index + 1])
+                index = block_index + 1
+                continue
+
+        sanitized.append(token)
+        index += 1
+
+    return sanitized
+
+
+def _string_function_url(token):
+    string_tokens = [arg for arg in token.arguments if arg.type == "string"]
+    if len(string_tokens) == 1:
+        return string_tokens[0].value
+    return None
+
+
+def _parentheses_block_url(token):
+    string_tokens = [arg for arg in token.content if arg.type == "string"]
+    if len(string_tokens) == 1:
+        return string_tokens[0].value
+    if string_tokens:
+        return None
+    return tinycss2.serialize(token.content).strip()

@@ -2,8 +2,6 @@ from itertools import chain
 import re
 import warnings
 
-from xml.sax.saxutils import unescape
-
 from bleach import html5lib_shim
 from bleach import parse_shim
 
@@ -52,6 +50,239 @@ INVISIBLE_REPLACEMENT_CHAR = "?"
 
 class NoCssSanitizerWarning(UserWarning):
     pass
+
+
+_URI_NORMALIZATION_RE = re.compile(r"[`\000-\040\177-\240\s]+")
+_NON_ASCII_RE = re.compile(r"[^\x00-\x7f]")
+_CSS_HEX_ESCAPE_RE = re.compile(r"\\([0-9a-fA-F]{1,6})")
+_CSS_WHITESPACE = " \t\r\n\f"
+
+
+def normalize_reference(value, css=False):
+    """Normalizes a URI/reference for semantic comparisons."""
+    normalized = html5lib_shim.convert_entities(value)
+    if css:
+        normalized = decode_css_escapes(normalized)
+
+    # Strip backticks, whitespace, controls, and non-ASCII characters.
+    normalized = _URI_NORMALIZATION_RE.sub("", normalized)
+    normalized = _NON_ASCII_RE.sub("", normalized)
+    return normalized.lower()
+
+
+def is_local_fragment_reference(value, css=False):
+    """Returns whether a reference is empty or starts with a fragment."""
+    decoded = html5lib_shim.convert_entities(value)
+    if css:
+        decoded = decode_css_escapes(decoded)
+
+    normalized = normalize_reference(value, css=css)
+    if normalized.startswith("#"):
+        return True
+
+    # A value that only disappears during normalization may be an obfuscated
+    # reference. Treat it as external; only genuinely empty values are local.
+    return not normalized and not decoded.strip()
+
+
+def is_external_reference(value, css=False):
+    """Returns whether a reference points outside the current document."""
+    return not is_local_fragment_reference(value, css=css)
+
+
+def decode_css_escapes(value):
+    """Decodes CSS backslash escapes in an identifier or string."""
+    result = []
+    index = 0
+    while index < len(value):
+        if value[index] != "\\" or index + 1 >= len(value):
+            result.append(value[index])
+            index += 1
+            continue
+
+        decoded, index = _decode_css_escape_at(value, index)
+        result.append(decoded)
+
+    return "".join(result)
+
+
+def _decode_css_escape_at(value, index):
+    match = _CSS_HEX_ESCAPE_RE.match(value, index)
+    if match:
+        code_point = int(match.group(1), 16)
+        next_index = match.end()
+        if next_index < len(value) and value[next_index] in _CSS_WHITESPACE:
+            next_index += 1
+
+        if code_point == 0 or code_point > 0x10FFFF or 0xD800 <= code_point <= 0xDFFF:
+            return "\ufffd", next_index
+        return chr(code_point), next_index
+
+    return value[index + 1], index + 2
+
+
+def _read_css_identifier(value, index):
+    result = []
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            decoded, index = _decode_css_escape_at(value, index)
+            result.append(decoded)
+        elif char.isalnum() or char in "_-" or ord(char) >= 128:
+            result.append(char)
+            index += 1
+        else:
+            break
+
+    return "".join(result), index
+
+
+def _skip_css_whitespace_and_comments(value, index):
+    length = len(value)
+    while index < length:
+        if value[index].isspace():
+            index += 1
+        elif value.startswith("/*", index):
+            comment_end = value.find("*/", index + 2)
+            if comment_end < 0:
+                return length, False
+            index = comment_end + 2
+        else:
+            break
+    return index, True
+
+
+def _iter_css_url_calls(value):
+    """Yields ``(start, end, raw_url)`` for lenient CSS ``url()`` calls."""
+    index = 0
+    length = len(value)
+
+    while index < length:
+        if index > 0:
+            previous = value[index - 1]
+            if (
+                previous == "\\"
+                or previous.isalnum()
+                or previous in "_-"
+                or ord(previous) >= 128
+            ):
+                index += 1
+                continue
+
+        if not (value[index].isalpha() or value[index] == "\\"):
+            index += 1
+            continue
+
+        identifier, identifier_end = _read_css_identifier(value, index)
+        if identifier.lower() != "url":
+            index += 1
+            continue
+
+        open_index = identifier_end
+        while open_index < length and value[open_index].isspace():
+            open_index += 1
+
+        if open_index >= length or value[open_index] != "(":
+            index += 1
+            continue
+
+        cursor, comments_closed = _skip_css_whitespace_and_comments(
+            value, open_index + 1
+        )
+        if not comments_closed:
+            yield index, length, None
+            return
+
+        if cursor < length and value[cursor] in "'\"":
+            quote = value[cursor]
+            url_start = cursor + 1
+            cursor = url_start
+
+            while cursor < length:
+                if value[cursor] == "\\" and cursor + 1 < length:
+                    cursor += 2
+                    continue
+                if value[cursor] == quote:
+                    break
+                cursor += 1
+
+            if cursor >= length:
+                yield index, length, None
+                return
+
+            raw_url = value[url_start:cursor]
+            cursor += 1
+            cursor, comments_closed = _skip_css_whitespace_and_comments(value, cursor)
+
+            if comments_closed and cursor < length and value[cursor] == ")":
+                end = cursor + 1
+            else:
+                yield index, length, None
+                return
+
+            yield index, end, raw_url
+            index = end
+            continue
+
+        url_start = cursor
+        while cursor < length:
+            if value[cursor] == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if value[cursor] == ")":
+                break
+            cursor += 1
+
+        if cursor >= length:
+            yield index, length, None
+            return
+
+        raw_url = value[url_start:cursor]
+        end = cursor + 1
+        yield index, end, raw_url
+        index = end
+
+
+def remove_nonlocal_css_urls(value):
+    """Removes non-fragment ``url()`` references from a CSS-like value."""
+    text = html5lib_shim.convert_entities(value)
+    result = []
+    last_end = 0
+
+    for start, end, raw_url in _iter_css_url_calls(text):
+        result.append(text[last_end:start])
+        if raw_url is not None and not is_external_reference(raw_url, css=True):
+            result.append(text[start:end])
+        else:
+            result.append(" ")
+        last_end = end
+
+    result.append(text[last_end:])
+    return "".join(result).strip()
+
+
+def uri_value_is_allowed(value, allowed_protocols):
+    """Applies Bleach's protocol policy to a normalized reference."""
+    normalized_uri = normalize_reference(value)
+
+    try:
+        parsed = parse_shim.urlparse(normalized_uri)
+    except ValueError:
+        return False
+
+    if parsed.scheme:
+        return parsed.scheme in allowed_protocols
+
+    if normalized_uri.startswith("#"):
+        return True
+
+    # Handle protocols that urlparse doesn't recognize like "myprotocol".
+    if ":" in normalized_uri and normalized_uri.split(":")[0] in allowed_protocols:
+        return True
+
+    # Protocol-relative and path-relative references are treated like
+    # implicit http/https URLs by the existing policy.
+    return "http" in allowed_protocols or "https" in allowed_protocols
 
 
 class Cleaner:
@@ -481,54 +712,8 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         :returns: allowed value or None
 
         """
-        # NOTE(willkg): This transforms the value into a normalized one that's
-        # easier to match and verify, but shouldn't get returned since it's
-        # vastly different than the original value.
-
-        # Convert all character entities in the value
-        normalized_uri = html5lib_shim.convert_entities(value)
-
-        # Strip backtick, whitespace, and control characters
-        normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
-
-        # Strip non-ASCII characters so that urlparse can parse the url into
-        # components correctly. This drops invisible and whitespace unicode
-        # characters among other things.
-        normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
-
-        # Lowercase value to make matching easier
-        normalized_uri = normalized_uri.lower()
-
-        try:
-            # Drop attributes with uri values that have protocols that aren't
-            # allowed
-            parsed = parse_shim.urlparse(normalized_uri)
-        except ValueError:
-            # URI is impossible to parse, therefore it's not allowed
-            return None
-
-        if parsed.scheme:
-            # If urlparse found a scheme, check that
-            if parsed.scheme in allowed_protocols:
-                return value
-
-        else:
-            # Allow uris that are just an anchor
-            if normalized_uri.startswith("#"):
-                return value
-
-            # Handle protocols that urlparse doesn't recognize like "myprotocol"
-            if (
-                ":" in normalized_uri
-                and normalized_uri.split(":")[0] in allowed_protocols
-            ):
-                return value
-
-            # If there's no protocol/scheme specified, then assume it's "http" or
-            # "https" and see if that's allowed
-            if "http" in allowed_protocols or "https" in allowed_protocols:
-                return value
-
+        if uri_value_is_allowed(value, allowed_protocols):
+            return value
         return None
 
     def allow_token(self, token):
@@ -561,8 +746,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
 
                 # Drop values in svg attrs with non-local IRIs
                 if namespaced_name in self.svg_attr_val_allows_ref:
-                    new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(val))
-                    new_val = new_val.strip()
+                    new_val = remove_nonlocal_css_urls(val)
                     if not new_val:
                         continue
 
@@ -577,7 +761,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                         (None, "href"),
                         (html5lib_shim.namespaces["xlink"], "href"),
                     ]:
-                        if re.search(r"^\s*[^#\s]", val):
+                        if is_external_reference(val):
                             continue
 
                 # If it's a style attribute, sanitize it
