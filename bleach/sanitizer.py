@@ -213,6 +213,9 @@ def attribute_filter_factory(attributes):
     function appropriate to the attributes value. One nice thing about this is
     that there's less if/then shenanigans in the ``allow_token`` method.
 
+    Namespaced attributes are passed to the filter as their full
+    ``prefix:local`` name.
+
     """
     if callable(attributes):
         return attributes
@@ -247,6 +250,22 @@ def attribute_filter_factory(attributes):
         return _attr_filter
 
     raise ValueError("attributes needs to be a callable, a list or a dict")
+
+
+def _attribute_name(namespaced_name):
+    """Returns the full name for a namespaced attribute."""
+    namespace, name = namespaced_name
+    if namespace is None:
+        return name
+
+    if namespace == html5lib_shim.namespaces["xmlns"] and name == "xmlns":
+        return name
+
+    prefix = html5lib_shim.prefixes.get(namespace)
+    if prefix is None:
+        return f"{{{namespace}}}{name}"
+
+    return f"{prefix}:{name}"
 
 
 class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
@@ -543,24 +562,27 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
             attrs = {}
             for namespaced_name, val in token["data"].items():
                 namespace, name = namespaced_name
+                full_attr_name = _attribute_name(namespaced_name)
 
                 # Drop attributes that are not explicitly allowed
-                #
-                # NOTE(willkg): We pass in the attribute name--not a namespaced
-                # name.
-                if not self.attr_filter(token["name"], name, val):
+                if not self.attr_filter(token["name"], full_attr_name, val):
                     continue
 
                 # Drop attributes with uri values that use a disallowed protocol
                 # Sanitize attributes with uri values
-                if namespaced_name in self.attr_val_is_uri:
+                if namespaced_name in self.attr_val_is_uri or (
+                    namespace is not None and (None, name) in self.attr_val_is_uri
+                ):
                     new_value = self.sanitize_uri_value(val, self.allowed_protocols)
                     if new_value is None:
                         continue
                     val = new_value
 
                 # Drop values in svg attrs with non-local IRIs
-                if namespaced_name in self.svg_attr_val_allows_ref:
+                if namespaced_name in self.svg_attr_val_allows_ref or (
+                    namespace is not None
+                    and (None, name) in self.svg_attr_val_allows_ref
+                ):
                     new_val = re.sub(r"url\s*\(\s*[^#\s][^)]+?\)", " ", unescape(val))
                     new_val = new_val.strip()
                     if not new_val:
@@ -581,7 +603,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                             continue
 
                 # If it's a style attribute, sanitize it
-                if namespaced_name == (None, "style"):
+                if name == "style":
                     if self.css_sanitizer:
                         val = self.css_sanitizer.sanitize_css(val)
                     else:

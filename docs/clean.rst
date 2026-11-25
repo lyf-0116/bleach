@@ -144,6 +144,24 @@ and "class" for any tag (including "a" and "img"):
    '<img alt="an example">'
 
 
+Namespaced attributes
+---------------------
+
+Namespaced attributes must be allowed by their full ``prefix:local`` name.
+Allowing the local name only allows an attribute without a namespace. For
+example, this allows ``xlink:href`` but not ``href``:
+
+.. code-block:: python
+
+   bleach.clean(
+       '<svg><a xlink:href="https://example.com">link</a></svg>',
+       tags={'svg', 'a'},
+       attributes={'a': ['xlink:href']},
+   )
+
+Callables receive the full namespaced attribute name as well.
+
+
 Using functions
 ---------------
 

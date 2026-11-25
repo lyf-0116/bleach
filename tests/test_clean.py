@@ -522,6 +522,69 @@ def test_attributes_list():
     assert clean(text, tags=TAGS, attributes=ATTRS) == '<a title="blah">example</a>'
 
 
+def test_attributes_namespaced_requires_full_name():
+    """Namespaced attributes require their full name in the allowlist."""
+    TAGS = {"svg", "a"}
+    text = '<svg><a xlink:href="https://example.com">example</a></svg>'
+
+    assert (
+        clean(text, tags=TAGS, attributes={"a": ["href"]})
+        == "<svg><a>example</a></svg>"
+    )
+    assert (
+        clean(text, tags=TAGS, attributes={"a": ["xlink:href"]})
+        == '<svg><a href="https://example.com">example</a></svg>'
+    )
+
+
+def test_attributes_namespaced_callable_full_name():
+    """Attribute callables receive the full namespaced attribute name."""
+    TAGS = {"svg", "a"}
+    text = '<svg><a xlink:title="example">example</a></svg>'
+
+    def allow_local_name(tag, name, value):
+        return name == "title"
+
+    def allow_full_name(tag, name, value):
+        return name == "xlink:title"
+
+    assert (
+        clean(text, tags=TAGS, attributes=allow_local_name)
+        == "<svg><a>example</a></svg>"
+    )
+    assert (
+        clean(text, tags=TAGS, attributes=allow_full_name)
+        == '<svg><a title="example">example</a></svg>'
+    )
+
+
+def test_attributes_namespaced_xmlns():
+    """Default and prefixed XML namespace declarations use their full name."""
+    TAGS = {"svg"}
+    text = (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        'xmlns:xlink="http://www.w3.org/1999/xlink">example</svg>'
+    )
+
+    assert (
+        clean(text, tags=TAGS, attributes={"svg": ["xmlns"]})
+        == '<svg xmlns="http://www.w3.org/2000/svg">example</svg>'
+    )
+    assert (
+        clean(text, tags=TAGS, attributes={"svg": ["xmlns:xlink"]})
+        == '<svg xlink="http://www.w3.org/1999/xlink">example</svg>'
+    )
+
+
+def test_attributes_namespaced_href_allowed_protocols():
+    """Explicitly allowed namespaced URI attributes are protocol-sanitized."""
+    TAGS = {"svg", "a"}
+    ATTRS = {"a": ["xlink:href"]}
+
+    text = '<svg><a xlink:href="javascript:alert(1)">example</a></svg>'
+    assert clean(text, tags=TAGS, attributes=ATTRS) == "<svg><a>example</a></svg>"
+
+
 @pytest.mark.parametrize(
     "data, kwargs, expected",
     [
@@ -702,7 +765,7 @@ def test_svg_allow_local_href(text, expected):
     """Keep local hrefs for svg elements"""
     TAGS = {"svg", "pattern"}
     ATTRS = {
-        "pattern": ["id", "href"],
+        "pattern": ["id", "href", "xlink:href"],
     }
     assert clean(text, tags=TAGS, attributes=ATTRS) == expected
 
@@ -724,7 +787,7 @@ def test_svg_allow_local_href_nonlocal(text, expected):
     """Drop non-local hrefs for svg elements"""
     TAGS = {"svg", "pattern"}
     ATTRS = {
-        "pattern": ["id", "href"],
+        "pattern": ["id", "href", "xlink:href"],
     }
     assert clean(text, tags=TAGS, attributes=ATTRS) == expected
 
