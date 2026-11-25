@@ -1,4 +1,5 @@
 from itertools import chain
+import inspect
 import re
 import warnings
 
@@ -37,6 +38,119 @@ ALLOWED_ATTRIBUTES = {
 #: Set of allowed protocols
 ALLOWED_PROTOCOLS = frozenset(("http", "https", "mailto"))
 
+
+# URI usage contexts. Navigation may safely use protocol-relative references
+# because the browser only navigates to them. Resource contexts cause the
+# response to be loaded or interpreted, so external protocol-relative
+# references are treated as a distinct, higher-risk policy.
+URI_CONTEXT_NAVIGATION = "navigation"
+URI_CONTEXT_RESOURCE = "resource"
+URI_CONTEXT_STYLE = "style"
+URI_CONTEXT_LEGACY = "legacy"
+
+# Omitted contexts fail closed. Internal HTML call sites always classify the
+# attribute explicitly; direct callers that need the old policy can opt into
+# URI_CONTEXT_LEGACY.
+URI_CONTEXT_DEFAULT = URI_CONTEXT_RESOURCE
+
+# Contexts in which network-path references (``//host/path`` and browser-
+# equivalent separator forms) are part of the allowed reference set.
+PROTOCOL_RELATIVE_URI_CONTEXTS = frozenset((URI_CONTEXT_NAVIGATION, URI_CONTEXT_LEGACY))
+
+# Descriptive aliases for callers that name contexts by HTML attribute.
+URI_CONTEXT_LINK = URI_CONTEXT_NAVIGATION
+URI_CONTEXT_HREF = URI_CONTEXT_NAVIGATION
+URI_CONTEXT_SRC = URI_CONTEXT_RESOURCE
+
+
+class UriContext:
+    """Named URI usage scenarios accepted by :func:`sanitize_uri_value`."""
+
+    DEFAULT = URI_CONTEXT_DEFAULT
+    LEGACY = URI_CONTEXT_LEGACY
+    LINK = URI_CONTEXT_NAVIGATION
+    NAVIGATION = URI_CONTEXT_NAVIGATION
+    HREF = URI_CONTEXT_NAVIGATION
+    RESOURCE = URI_CONTEXT_RESOURCE
+    SRC = URI_CONTEXT_RESOURCE
+    STYLE = URI_CONTEXT_STYLE
+
+
+URIContext = UriContext
+UrlContext = UriContext
+URLContext = UriContext
+
+
+_CONTEXT_ALIASES = {
+    None: URI_CONTEXT_RESOURCE,
+    "": URI_CONTEXT_RESOURCE,
+    "default": URI_CONTEXT_RESOURCE,
+    "safe": URI_CONTEXT_RESOURCE,
+    "secure": URI_CONTEXT_RESOURCE,
+    "generic": URI_CONTEXT_LEGACY,
+    "uri": URI_CONTEXT_LEGACY,
+    "url": URI_CONTEXT_LEGACY,
+    "auto": URI_CONTEXT_LEGACY,
+    "legacy": URI_CONTEXT_LEGACY,
+    "compatibility": URI_CONTEXT_LEGACY,
+    "link": URI_CONTEXT_NAVIGATION,
+    "links": URI_CONTEXT_NAVIGATION,
+    "anchor": URI_CONTEXT_NAVIGATION,
+    "a": URI_CONTEXT_NAVIGATION,
+    "navigation": URI_CONTEXT_NAVIGATION,
+    "navigate": URI_CONTEXT_NAVIGATION,
+    "href": URI_CONTEXT_NAVIGATION,
+    "action": URI_CONTEXT_NAVIGATION,
+    "form": URI_CONTEXT_NAVIGATION,
+    "forms": URI_CONTEXT_NAVIGATION,
+    "button": URI_CONTEXT_NAVIGATION,
+    "formaction": URI_CONTEXT_NAVIGATION,
+    "ping": URI_CONTEXT_NAVIGATION,
+    "cite": URI_CONTEXT_NAVIGATION,
+    "longdesc": URI_CONTEXT_NAVIGATION,
+    "resource": URI_CONTEXT_RESOURCE,
+    "resources": URI_CONTEXT_RESOURCE,
+    "asset": URI_CONTEXT_RESOURCE,
+    "assets": URI_CONTEXT_RESOURCE,
+    "embed": URI_CONTEXT_RESOURCE,
+    "embedded": URI_CONTEXT_RESOURCE,
+    "frame": URI_CONTEXT_RESOURCE,
+    "iframe": URI_CONTEXT_RESOURCE,
+    "object": URI_CONTEXT_RESOURCE,
+    "data": URI_CONTEXT_RESOURCE,
+    "script": URI_CONTEXT_RESOURCE,
+    "media": URI_CONTEXT_RESOURCE,
+    "img": URI_CONTEXT_RESOURCE,
+    "image": URI_CONTEXT_RESOURCE,
+    "src": URI_CONTEXT_RESOURCE,
+    "poster": URI_CONTEXT_RESOURCE,
+    "background": URI_CONTEXT_RESOURCE,
+    "active": URI_CONTEXT_RESOURCE,
+    "loading": URI_CONTEXT_RESOURCE,
+    "load": URI_CONTEXT_RESOURCE,
+    "dangerous": URI_CONTEXT_RESOURCE,
+    "strict": URI_CONTEXT_RESOURCE,
+    "style": URI_CONTEXT_STYLE,
+    "css": URI_CONTEXT_STYLE,
+}
+
+
+# Attributes whose values are navigated to rather than loaded as a resource.
+# ``href`` is resolved per-tag because elements such as ``link`` and SVG
+# ``use`` also use href to load resources.
+NAVIGATION_URI_ATTRIBUTES = frozenset(
+    ("action", "formaction", "ping", "cite", "longdesc")
+)
+
+# Tags for which href-like attributes cause a resource to be loaded.
+RESOURCE_HREF_TAGS = frozenset(
+    ("link", "use", "image", "feimage", "script", "audio", "video", "source")
+)
+
+# html5lib's URI set predates some object/data usage; keep the additions
+# explicit so callers passing a custom attr_val_is_uri retain that policy.
+EXTRA_URI_ATTRIBUTES = frozenset(("data",))
+
 #: Invisible characters--0 to and including 31 except 9 (tab), 10 (lf), and 13 (cr)
 INVISIBLE_CHARACTERS = "".join(
     [chr(c) for c in chain(range(0, 9), range(11, 13), range(14, 32))]
@@ -52,6 +166,143 @@ INVISIBLE_REPLACEMENT_CHAR = "?"
 
 class NoCssSanitizerWarning(UserWarning):
     pass
+
+
+def _context_value(context):
+    """Returns the string value for a context or context-like object."""
+    value = getattr(context, "value", context)
+    if value is None:
+        return None
+    return str(value).strip().lower()
+
+
+def normalize_uri_context(context=None, **aliases):
+    """Normalizes a URI context argument to one of the supported constants."""
+    if context is None:
+        for name, value in aliases.items():
+            normalized_name = name.lower()
+            if (
+                any(
+                    term in normalized_name
+                    for term in (
+                        "context",
+                        "scenario",
+                        "scene",
+                        "usage",
+                        "purpose",
+                        "location",
+                        "position",
+                        "placement",
+                    )
+                )
+                and value is not None
+            ):
+                context = value
+                break
+
+    if context is None:
+        for value in aliases.values():
+            if _context_value(value) in _CONTEXT_ALIASES:
+                context = value
+                break
+
+    context_name = _context_value(context)
+    return _CONTEXT_ALIASES.get(context_name, URI_CONTEXT_RESOURCE)
+
+
+def _normalize_uri_value(value):
+    """Normalizes a URI for protocol and reference classification."""
+    normalized_uri = html5lib_shim.convert_entities(value)
+    normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
+    normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
+    return normalized_uri.lower()
+
+
+def _is_protocol_relative_uri(normalized_uri):
+    """Returns whether a schemeless URI selects another origin by authority.
+
+    Two or more leading slash/backslash characters begin an authority-like
+    reference. WHATWG URL parsing also treats backslashes as separators for
+    special schemes and ignores extra leading separators when finding host.
+    Python's urlparse does not match that behavior for all of these forms.
+    """
+    return re.match(r"^[\\/]{2}", normalized_uri) is not None
+
+
+def _context_allows_protocol_relative(context, options):
+    explicit = options.get("allow_protocol_relative")
+    if explicit is not None:
+        return bool(explicit)
+
+    return context in PROTOCOL_RELATIVE_URI_CONTEXTS
+
+
+def sanitize_uri_value(
+    value,
+    allowed_protocols=ALLOWED_PROTOCOLS,
+    context=None,
+    **kwargs,
+):
+    """Checks a uri value according to its usage context.
+
+    :arg value: the uri value to sanitize
+
+    :arg allowed_protocols: set of allowed protocols
+
+    :arg context: one of the ``URI_CONTEXT_*`` constants or a descriptive
+        alias such as ``"link"``, ``"href"``, ``"resource"``, ``"src"`` or
+        ``"style"``
+
+    :returns: allowed value or None
+
+    """
+    # Tolerate the alternate plausible argument order
+    # sanitize_uri_value(value, "resource", protocols).
+    if not isinstance(
+        allowed_protocols, (str, frozenset, set, tuple, list, type(None))
+    ):
+        protocols_candidate = context
+        context = allowed_protocols
+        allowed_protocols = protocols_candidate
+    elif isinstance(allowed_protocols, str):
+        if context is None or not isinstance(context, str):
+            allowed_protocols, context = context, allowed_protocols
+
+    context = normalize_uri_context(context, **kwargs)
+
+    if kwargs.get("protocols") is not None:
+        allowed_protocols = kwargs["protocols"]
+
+    if allowed_protocols is None:
+        allowed_protocols = ALLOWED_PROTOCOLS
+    allowed_protocols = frozenset(allowed_protocols)
+
+    normalized_uri = _normalize_uri_value(value)
+
+    try:
+        parsed = parse_shim.urlparse(normalized_uri)
+    except ValueError:
+        return None
+
+    if parsed.scheme:
+        if parsed.scheme in allowed_protocols:
+            return value
+        return None
+
+    if normalized_uri.startswith("#"):
+        return value
+
+    if ":" in normalized_uri and normalized_uri.split(":")[0] in allowed_protocols:
+        return value
+
+    if _is_protocol_relative_uri(normalized_uri):
+        if not _context_allows_protocol_relative(context, kwargs):
+            return None
+
+    if "http" in allowed_protocols or "https" in allowed_protocols:
+        return value
+
+    return None
 
 
 class Cleaner:
@@ -314,9 +565,21 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
         self.strip_html_comments = strip_html_comments
 
         self.attr_val_is_uri = attr_val_is_uri
+        self.uri_attribute_names = {
+            attribute_name for _, attribute_name in attr_val_is_uri
+        } | EXTRA_URI_ATTRIBUTES
         self.svg_attr_val_allows_ref = svg_attr_val_allows_ref
         self.css_sanitizer = css_sanitizer
         self.svg_allow_local_href = svg_allow_local_href
+        self._css_sanitize_parameters = self._get_css_sanitize_parameters()
+
+    def _get_css_sanitize_parameters(self):
+        if self.css_sanitizer is None:
+            return None
+        try:
+            return inspect.signature(self.css_sanitizer.sanitize_css).parameters
+        except (TypeError, ValueError):
+            return None
 
     def sanitize_stream(self, token_iterator):
         for token in token_iterator:
@@ -472,64 +735,47 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
 
         return new_tokens
 
-    def sanitize_uri_value(self, value, allowed_protocols):
+    def uri_context_for_attribute(self, tag, namespaced_name):
+        """Returns the URI usage context for a token attribute.
+
+        Navigation attributes keep the historical policy for
+        protocol-relative references. Every other URI attribute is treated as
+        a resource-loading context, including ``src`` and ``object[data]``.
+        """
+        namespace, attribute_name = namespaced_name
+        normalized_tag = (tag or "").lower()
+        normalized_attribute = (attribute_name or "").lower()
+
+        if normalized_attribute == "style":
+            return URI_CONTEXT_STYLE
+
+        if normalized_attribute == "href":
+            if normalized_tag in RESOURCE_HREF_TAGS:
+                return URI_CONTEXT_RESOURCE
+            return URI_CONTEXT_NAVIGATION
+
+        if normalized_attribute in NAVIGATION_URI_ATTRIBUTES:
+            return URI_CONTEXT_NAVIGATION
+
+        return URI_CONTEXT_RESOURCE
+
+    def sanitize_uri_value(
+        self,
+        value,
+        allowed_protocols=ALLOWED_PROTOCOLS,
+        context=None,
+        **kwargs,
+    ):
         """Checks a uri value to see if it's allowed
 
         :arg value: the uri value to sanitize
         :arg allowed_protocols: set of allowed protocols
+        :arg context: explicit usage context for the URI value
 
         :returns: allowed value or None
 
         """
-        # NOTE(willkg): This transforms the value into a normalized one that's
-        # easier to match and verify, but shouldn't get returned since it's
-        # vastly different than the original value.
-
-        # Convert all character entities in the value
-        normalized_uri = html5lib_shim.convert_entities(value)
-
-        # Strip backtick, whitespace, and control characters
-        normalized_uri = re.sub(r"[`\000-\040\177-\240\s]+", "", normalized_uri)
-
-        # Strip non-ASCII characters so that urlparse can parse the url into
-        # components correctly. This drops invisible and whitespace unicode
-        # characters among other things.
-        normalized_uri = re.sub(r"[^\x00-\x7f]", "", normalized_uri)
-
-        # Lowercase value to make matching easier
-        normalized_uri = normalized_uri.lower()
-
-        try:
-            # Drop attributes with uri values that have protocols that aren't
-            # allowed
-            parsed = parse_shim.urlparse(normalized_uri)
-        except ValueError:
-            # URI is impossible to parse, therefore it's not allowed
-            return None
-
-        if parsed.scheme:
-            # If urlparse found a scheme, check that
-            if parsed.scheme in allowed_protocols:
-                return value
-
-        else:
-            # Allow uris that are just an anchor
-            if normalized_uri.startswith("#"):
-                return value
-
-            # Handle protocols that urlparse doesn't recognize like "myprotocol"
-            if (
-                ":" in normalized_uri
-                and normalized_uri.split(":")[0] in allowed_protocols
-            ):
-                return value
-
-            # If there's no protocol/scheme specified, then assume it's "http" or
-            # "https" and see if that's allowed
-            if "http" in allowed_protocols or "https" in allowed_protocols:
-                return value
-
-        return None
+        return sanitize_uri_value(value, allowed_protocols, context, **kwargs)
 
     def allow_token(self, token):
         """Handles the case where we're allowing the tag"""
@@ -553,8 +799,20 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
 
                 # Drop attributes with uri values that use a disallowed protocol
                 # Sanitize attributes with uri values
-                if namespaced_name in self.attr_val_is_uri:
-                    new_value = self.sanitize_uri_value(val, self.allowed_protocols)
+                is_uri_attribute = (
+                    namespaced_name in self.attr_val_is_uri
+                    or name in self.uri_attribute_names
+                )
+
+                if is_uri_attribute:
+                    uri_context = self.uri_context_for_attribute(
+                        token["name"], namespaced_name
+                    )
+                    new_value = self.sanitize_uri_value(
+                        val,
+                        self.allowed_protocols,
+                        context=uri_context,
+                    )
                     if new_value is None:
                         continue
                     val = new_value
@@ -583,7 +841,7 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
                 # If it's a style attribute, sanitize it
                 if namespaced_name == (None, "style"):
                     if self.css_sanitizer:
-                        val = self.css_sanitizer.sanitize_css(val)
+                        val = self._sanitize_css(val)
                     else:
                         # FIXME(willkg): if style is allowed, but no
                         # css_sanitizer was set up, then this is probably a
@@ -599,6 +857,29 @@ class BleachSanitizerFilter(html5lib_shim.SanitizerFilter):
             token["data"] = attrs
 
         return token
+
+    def _sanitize_css(self, value):
+        """Calls the CSS sanitizer while propagating the URI protocol policy."""
+        sanitize_css = self.css_sanitizer.sanitize_css
+        parameters = self._css_sanitize_parameters
+        if parameters is None:
+            return sanitize_css(value)
+
+        has_keyword_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        if "allowed_protocols" in parameters or has_keyword_kwargs:
+            return sanitize_css(
+                value,
+                allowed_protocols=self.allowed_protocols,
+            )
+        if "protocols" in parameters:
+            return sanitize_css(
+                value,
+                protocols=self.allowed_protocols,
+            )
+        return sanitize_css(value)
 
     def disallowed_token(self, token):
         token_type = token["type"]

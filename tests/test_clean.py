@@ -4,7 +4,12 @@ import pytest
 
 from bleach import clean
 from bleach.html5lib_shim import Filter
-from bleach.sanitizer import ALLOWED_PROTOCOLS, Cleaner, NoCssSanitizerWarning
+from bleach.sanitizer import (
+    ALLOWED_PROTOCOLS,
+    Cleaner,
+    NoCssSanitizerWarning,
+    sanitize_uri_value,
+)
 from bleach._vendor.html5lib.constants import rcdataElements
 
 
@@ -440,6 +445,79 @@ def test_formaction_attribute():
 
     ok = '<button formaction="/foo">x</button>'
     assert clean(ok, tags=tags, attributes=attrs) == ok
+
+
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        (
+            '<a href="//evil.example/path">x</a>',
+            '<a href="//evil.example/path">x</a>',
+        ),
+        (
+            '<form action="//evil.example/submit">x</form>',
+            '<form action="//evil.example/submit">x</form>',
+        ),
+        (
+            '<button formaction="//evil.example/do">x</button>',
+            '<button formaction="//evil.example/do">x</button>',
+        ),
+        ('<img src="//evil.example/x.png">', "<img>"),
+        (
+            '<iframe src="//evil.example/frame"></iframe>',
+            "<iframe></iframe>",
+        ),
+        (
+            '<object data="//evil.example/object"></object>',
+            "<object></object>",
+        ),
+        (
+            '<video poster="//evil.example/poster.png"></video>',
+            "<video></video>",
+        ),
+        (
+            '<link rel="stylesheet" href="//evil.example/style.css">',
+            '<link rel="stylesheet">',
+        ),
+    ],
+)
+def test_protocol_relative_uri_is_context_sensitive(text, expected):
+    tags = {
+        "a",
+        "button",
+        "form",
+        "iframe",
+        "img",
+        "link",
+        "object",
+        "video",
+    }
+
+    def attributes(tag, name, value):
+        return True
+
+    assert clean(text, tags=tags, attributes=attributes) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "//evil.example/x",
+        "///evil.example/x",
+        "\\\\evil.example\\x",
+        "/\\evil.example/x",
+    ],
+)
+def test_resource_uri_context_blocks_browser_external_references(value):
+    assert sanitize_uri_value(value, ALLOWED_PROTOCOLS, "resource") is None
+    assert sanitize_uri_value(value, ALLOWED_PROTOCOLS, "link") == value
+
+
+def test_uri_context_defaults_to_fail_closed():
+    value = "//evil.example/x"
+
+    assert sanitize_uri_value(value, ALLOWED_PROTOCOLS) is None
+    assert sanitize_uri_value(value, ALLOWED_PROTOCOLS, context="legacy") == value
 
 
 def test_attributes_callable():

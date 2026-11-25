@@ -240,6 +240,47 @@ Default protocols are in ``bleach.sanitizer.ALLOWED_PROTOCOLS``.
 .. autodata:: bleach.sanitizer.ALLOWED_PROTOCOLS
 
 
+URI usage contexts
+------------------
+
+Whether a schemeless URI is safe depends on where the URI is used. A
+protocol-relative URI such as ``//example.com/path`` only navigates the user
+when it appears in an ``<a href>`` or a form submission attribute. The same
+value in ``src``, ``poster``, ``data`` or a CSS ``url()`` can cause the
+browser to load external content.
+
+Bleach therefore classifies URI attributes into navigation and resource
+contexts. Protocol-relative references remain allowed in navigation
+attributes, but are removed from resource-loading attributes:
+
+.. doctest::
+
+   >>> import bleach
+   >>> bleach.clean('<a href="//example.com/">link</a>')
+   '<a href="//example.com/">link</a>'
+
+   >>> bleach.clean(
+   ...     '<img src="//example.com/x.png">',
+   ...     tags={'img'},
+   ...     attributes={'img': ['src']},
+   ... )
+   '<img>'
+
+The low-level helper accepts an explicit context:
+
+.. code-block:: python
+
+   from bleach.sanitizer import sanitize_uri_value
+
+   sanitize_uri_value(value, protocols, context="link")
+   sanitize_uri_value(value, protocols, context="resource")
+   sanitize_uri_value(value, protocols, context="style")
+
+Omitting ``context`` fails closed and uses the resource policy. Callers that
+need the old context-independent behavior can pass
+``context=URI_CONTEXT_LEGACY``.
+
+
 Stripping markup (``strip``)
 ============================
 

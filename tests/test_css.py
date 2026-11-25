@@ -148,6 +148,31 @@ def test_urls(data, expected):
     assert clean(data, css_sanitizer=css_sanitizer) == expected
 
 
+@pytest.mark.parametrize(
+    "css_url",
+    [
+        "url(//evil.example/x.png)",
+        "url('//evil.example/x.png')",
+        'url("//evil.example/x.png")',
+    ],
+)
+def test_protocol_relative_urls_are_dropped(css_url):
+    css_sanitizer = CSSSanitizer(allowed_css_properties=["background"])
+    style = f"background: {css_url}; color: red;"
+
+    sanitized = css_sanitizer.sanitize_css(style)
+
+    assert "evil.example" not in sanitized
+    assert "background" not in sanitized
+
+
+def test_relative_urls_remain_allowed_in_css():
+    css_sanitizer = CSSSanitizer(allowed_css_properties=["background"])
+    style = "background: url(local/image.png);"
+
+    assert css_sanitizer.sanitize_css(style) == style
+
+
 def test_style_hang():
     """The sanitizer should not hang on any inline styles"""
     style = [
